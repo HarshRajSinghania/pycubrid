@@ -55,11 +55,20 @@ mutation: ## Run mutation testing on the driver core (pip install -e ".[dev,muta
 
 integration: docker-up ## Run integration tests against a Docker CUBRID
 	@echo "Waiting for CUBRID to be ready..."
-	@sleep 10
+	@set +e; \
+	sleep 10; \
 	CUBRID_TEST_URL="cubrid://dba@localhost:33000/testdb" \
 		CUBRID_TEST_DOCKER_CONTAINER="$$(docker compose ps -q cubrid)" \
-		$(PYTEST) $(TESTS)/ -m integration -v
-	$(MAKE) docker-down
+		$(PYTEST) $(TESTS)/ -m integration -v; \
+	test_status=$$?; \
+	$(MAKE) -f $(abspath $(firstword $(MAKEFILE_LIST))) docker-down; \
+	down_status=$$?; \
+	if [ $$down_status -ne 0 ]; then \
+		echo "ERROR: docker-down failed with status $$down_status"; \
+		if [ $$test_status -ne 0 ]; then exit $$test_status; fi; \
+		exit $$down_status; \
+	fi; \
+	exit $$test_status
 
 integration-local: ## Run integration tests against an already-running CUBRID (set CUBRID_TEST_URL or CUBRID_TEST_HOST; no Docker)
 	@if [ -z "$$CUBRID_TEST_URL" ] && [ -z "$$CUBRID_TEST_HOST" ]; then \
@@ -70,12 +79,21 @@ integration-local: ## Run integration tests against an already-running CUBRID (s
 
 integration-tls: docker-up ## Run async TLS integration tests (requires SSL=ON broker; see CONTRIBUTING.md)
 	@echo "Waiting for CUBRID to be ready..."
-	@sleep 10
 	@echo "NOTE: requires CUBRID_TLS_TEST_HOST/PORT/CA/DB/USER env vars and a broker with SSL=ON."
 	@echo "      For an automated equivalent including SSL=ON flip + cert extraction,"
 	@echo "      see the 'integration-tls' job in .github/workflows/integration-full.yml."
-	$(PYTEST) $(TESTS)/test_aio_ssl_integration.py -v
-	$(MAKE) docker-down
+	@set +e; \
+	sleep 10; \
+	$(PYTEST) $(TESTS)/test_aio_ssl_integration.py -v; \
+	test_status=$$?; \
+	$(MAKE) -f $(abspath $(firstword $(MAKEFILE_LIST))) docker-down; \
+	down_status=$$?; \
+	if [ $$down_status -ne 0 ]; then \
+		echo "ERROR: docker-down failed with status $$down_status"; \
+		if [ $$test_status -ne 0 ]; then exit $$test_status; fi; \
+		exit $$down_status; \
+	fi; \
+	exit $$test_status
 
 docker-up: ## Start CUBRID Docker container
 	docker compose up -d
