@@ -26,10 +26,12 @@ def mock_connection() -> MagicMock:
     conn = MagicMock()
     conn.autocommit = False
     conn._connected = True
-    conn._cas_info = b"\x01\x01\x02\x03"
+    conn._record_reply_cas_info(b"\x01\x01\x02\x03")
     conn._cursors = set()
     conn._ensure_connected = MagicMock()
     conn._no_backslash_escapes = False
+    # A pooling-off broker: CLOSE_REQ is sent, never deferred (#488).
+    conn._defer_close = MagicMock(return_value=False)
 
     def send_and_receive(packet: object) -> object:
         return packet

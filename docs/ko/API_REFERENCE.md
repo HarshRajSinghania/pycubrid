@@ -50,6 +50,7 @@ CUBRID용 순수 Python DB-API 2.0 드라이버 pycubrid의 완전한 API 문서
   - [NotSupportedError](#notsupportederror)
 - [타입 객체](#타입-객체)
 - [타입 생성자](#타입-생성자)
+  - [타입 지정 컬렉션 파라미터](#타입-지정-컬렉션-파라미터)
 
 ---
 
@@ -185,7 +186,8 @@ conn = pycubrid.connect(
 ## 명시적 네이티브 호환 기능
 
 옵트인 `pycubrid.compat.native`는 순수 Python 동기 전송 위에 INT32,
-문자열, SQL NULL만 지원하는 **동기 prepared 커서**를 제공합니다. 문자열은 연결
+문자열, SQL NULL과 [SET/MULTISET/SEQUENCE 컬렉션 값](#컬렉션-바인딩-set-imports-bind_set)만
+지원하는 **동기 prepared 커서**를 제공합니다. 문자열은 연결
 문자셋을 사용합니다.
 기존 `pycubrid.connect()`와 `pycubrid.aio`의 `execute()`는 그대로 FC41을
 사용합니다. `pycubrid.compat.cubriddb` 래퍼는 아직 연결 생성·종료만
@@ -209,9 +211,9 @@ autocommit이 켜진 상태로 시작하며 기존 드라이버의 dba/수동 �
 다른 백엔드, HA/TLS URL 옵션과 초과 인자는 연결 전에 거부하며 오류에 계정 정보가 담긴 DSN
 원문을 노출하지 않습니다.
 
-네이티브 연결은 `cursor()`, `commit()`, `rollback()`, `close()`를 제공합니다.
+네이티브 연결은 `cursor()`, `set()`, `commit()`, `rollback()`, `close()`를 제공합니다.
 커서는 `prepare(sql)`, 1부터 시작하는 `bind_param(index, value,
-bind_type=0)`, `execute(option=0, max_col_size=0) -> int`, 튜플만 반환하는
+bind_type=0)`, `bind_set(index, s)`, `execute(option=0, max_col_size=0) -> int`, 튜플만 반환하는
 `fetch_row(how=0)`, `close()`를 지원합니다. 기본값이 아닌 플래그와 다른
 Python 값 형식은 실행 전 거부합니다. 브로커가 현재 세션의 statement
 pooling을 알리지 않거나 비활성화한 경우 FC2 전에 거부합니다. 핸들은
@@ -228,6 +230,85 @@ HOLDABLE SELECT 결과를 유지하고 `rollback()`은 버퍼에 든 행까지
 [typed CAS 설계](../PREPARED_BINDING_DESIGN.md)와
 [호환성 가이드](../UPSTREAM_COMPATIBILITY.md#selected-additive-contract-438)를
 참고하세요.
+
+### 컬렉션 바인딩 (`set`, `imports`, `bind_set`)
+
+#440부터 네이티브 기능은 공식 이름으로 SET, MULTISET, SEQUENCE 파라미터 값을
+바인딩합니다. `conn.set()`(또는 `native.set(conn)`)은 빈 `native.set`을 반환하고,
+`s.imports(data, type, /, *, kind=SET)`가 값을 정하며, `cur.bind_set(index, s)`가
+그 값을 1부터 시작하는 파라미터에 바인딩합니다. `execute()` 전에는 아무것도 보내지
+않으며 set은 서버 자원을 갖지 않습니다.
+
+- `data`는 `tuple`이어야 합니다(그 밖의 값은 공식 드라이버처럼 `InterfaceError`).
+  원소는 `str`, NULL 원소를 뜻하는 `None`, 또는 `type`이 INT일 때 부호 있는 64비트
+  범위의 `int`입니다(범위 밖은 `DataError`). `int`와 숫자 문자열 원소는 모두
+  텍스트로 보내므로 섞어 쓸 수 있습니다.
+  다른 원소 타입(`bool`, `float`, `bytes`, 중첩 컨테이너), NUL이 든 문자열, 인코딩할
+  수 없는 문자열은 `ProgrammingError` 또는 `DataError`를 내고, set은 이전 값을
+  유지합니다. `str` 하위 클래스는 먼저 일반 텍스트로 복사합니다.
+- `type`은 CHAR(`1`), STRING/VARCHAR(`2`), NUMERIC(`7`), INT(`8`), DATE(`13`) 같은
+  CCI 원소 타입 코드입니다. 예를 들어 `pycubrid.constants`의
+  `CUBRIDDataType.NUMERIC`을 씁니다. 공식 드라이버처럼 어떤 코드든 받으며 import의
+  표시일 뿐입니다. 공식 드라이버가 비트 문자열로 변환하는 BIT(`5`)와 VARBIT(`6`)은
+  `NotSupportedError`를, `int`가 아닌 코드는 `InterfaceError`를 냅니다.
+- 공식 드라이버처럼 모든 원소는 `type`과 관계없이 STRING(`2`) 원소로 보내며, 서버가
+  컬럼의 원소 타입으로 변환합니다. `int` 원소는 10진 텍스트로 보내므로
+  `imports((1, 2), INT)`는 공식 `imports(('1', '2'), INT)`와 같은 바이트를 보냅니다.
+  컬럼이 담을 수 없는 값은 `execute()` 때 서버에서 실패하며 prepared 핸들은 계속
+  쓸 수 있습니다. 원소가 문자열이므로 원소 타입이 없는 `SET` 컬럼에는 문자열로
+  저장됩니다.
+- `kind`는 SET(`16`, 기본값), MULTISET(`17`), SEQUENCE(`18`)입니다. 기본값은 공식
+  바이트를 그대로 보내므로 MULTISET이나 SEQUENCE 컬럼에도 SET 의미가 적용되어
+  중복이 사라지고 순서가 유지되지 않습니다. 중복을 유지하려면 `kind=MULTISET`,
+  순서와 중복을 유지하려면 `kind=SEQUENCE`를 넘깁니다. CUBRID 10.2와 11.4
+  브로커는 MULTISET 바인드 종류를 거부하므로(오류 -454) `kind=MULTISET`은
+  SEQUENCE로 보내며, 서버는 이를 MULTISET 컬럼에 중복과 함께 저장합니다.
+- `imports()`는 값을 교체합니다. `bind_set()`은 그 시점의 값을 바인딩하므로 이후의
+  `imports()`는 앞선 바인딩을 바꾸지 않습니다. 한 번도 import하지 않은 set은
+  공식 드라이버처럼 SQL NULL을 바인딩하며, `bind_param(index, None)`도 SQL NULL을
+  바인딩합니다.
+- `bind_set()`은 `native.set`이 아닌 값에 `InterfaceError`를, 잘못된 인덱스나 다른
+  문자셋으로 import한 set에 `ProgrammingError`를 냅니다. 이전 세션·닫힌 커서
+  규칙은 `bind_param()`과 같습니다.
+
+공식 드라이버와 의도적으로 다른 점은 각각 라이브 차등 비교 주장
+(`tests/fixtures/official_differential_claims.json`의 `bind-*`)으로 고정되어
+있습니다. `None`이 NULL 원소이고 텍스트 `'NULL'`은 문자열로 남습니다(공식은
+`'NULL'`을 NULL 원소로 바꿈). 빈 문자열과 Python `int` 원소를 허용합니다(공식은
+`InterfaceError`). NUL이 든 원소는 `ProgrammingError`를 냅니다(공식은 조용히
+잘라냄). `kind`는 pycubrid 확장입니다(공식은 항상 SET으로 바인딩). 오류 클래스는
+#439 prepared 커서를 따릅니다. `float`/`bytes` 원소와 잘못된 `bind_set` 인덱스는
+`ProgrammingError`(공식 `InterfaceError`), 연결이 아닌 값을 받은 `native.set()`은
+`InterfaceError`(공식 `TypeError`), 서버 오류 -494는 드라이버 전체 매핑에 따라
+`ProgrammingError`(공식 `IntegrityError`)입니다.
+
+공식 모듈과 마찬가지로 `from pycubrid.compat.native import *`는 `set` 이름을
+`native.set`에 바인딩하므로 그 네임스페이스에서 내장 `set`을 가립니다.
+래퍼의 `execute(query, args, set_type)`와 `executemany()` 컬렉션 형태는 제공하지
+않으며, 일반 `pycubrid` 커서는 계속 타입 지정 `pycubrid.types.Set`/`Multiset`/
+`Sequence` 리터럴 파라미터(#567)를 사용합니다.
+
+```python
+from pycubrid.compat import native
+from pycubrid.constants import CUBRIDDataType
+
+conn = native.connect("CUBRID:localhost:33000:testdb:::", "dba", "")
+try:
+    cur = conn.cursor()
+    try:
+        cur.prepare("INSERT INTO t (tags, scores) VALUES (?, ?)")
+        tags = conn.set()
+        tags.imports(("a", "b"), CUBRIDDataType.STRING)  # SET(VARCHAR)
+        scores = conn.set()
+        scores.imports((3, 1, 3), CUBRIDDataType.INT, kind=CUBRIDDataType.MULTISET)
+        cur.bind_set(1, tags)
+        cur.bind_set(2, scores)
+        cur.execute()
+    finally:
+        cur.close()
+finally:
+    conn.close()
+```
 
 ---
 
@@ -350,7 +431,9 @@ def commit(self) -> None
 현재 트랜잭션을 커밋합니다. 닫히지 않은 커서가 가진 쿼리 핸들에 `CLOSE_REQ`를
 보낸 뒤 서버로 `CommitPacket`을 보냅니다(#485). 이미 받은 행은 계속 읽을 수
 있습니다. autocommit 모드에서는 `END_TRAN`을 보내지 않으므로 커서를 닫아 서버
-핸들을 해제하세요. 이전 트랜잭션 밖 응답 뒤 CAS가 세션을 재활용했다면 요청 전에
+핸들을 해제하세요. statement pooling 브로커에서는 이 해제가 별도의 `CLOSE_REQ` 없이
+다음 문장에 실려 가며, `close()` 없이 수거된 커서도 같은 방식으로 해제됩니다
+([지연 닫기](PROTOCOL.md), #488). 이전 트랜잭션 밖 응답 뒤 CAS가 세션을 재활용했다면 요청 전에
 [트랜잭션 경계에서 CAS가 재활용되는 경우](CONNECTION.md)에
 설명한 검증된 재접속이 먼저 수행됩니다.
 
@@ -481,7 +564,8 @@ def ping(self, reconnect: bool = True) -> bool
 - `reconnect=True`이면 기존 소켓을 먼저 검사하고, 연결이 끊겼거나 검사 도중
   전송/프로토콜 오류가 발생했거나 `CHECK_CAS`가 음수 코드로 CAS–DB 링크 장애를
   보고하면 재접속을 한 번 시도합니다. `reconnect=False`는 음수 응답을
-  `False`로 보고하고 재접속하지 않습니다. 복구 후에는 명시적으로 설정한
+  `False`로 보고하고 재접속하지 않으며, 비동기 드라이버처럼 그 손상된 세션을
+  닫습니다(이후 호출은 `InterfaceError`). 복구 후에는 명시적으로 설정한
   autocommit만 복원합니다. 중단된 SQL은 자동 재실행하지 않으므로 재시도
   안전성은 호출자가 판단해야 합니다.
   자동 `no_backslash_escapes` 모드는 새 물리 세션에서 사용 전에 다시 감지하며,
@@ -630,7 +714,7 @@ def autocommit(self) -> bool
 def autocommit(self, value: bool) -> None
 ```
 
-자동 커밋 모드를 조회하거나 설정합니다. 활성화되면 각 문장이 즉시 커밋됩니다. 이 속성을 설정하면 서버에서 트랜잭션 상태를 플러시하기 위해 `SetDbParameterPacket`과 `CommitPacket`을 보냅니다.
+자동 커밋 모드를 조회하거나 설정합니다. 활성화되면 각 문장이 즉시 커밋됩니다. 이 속성을 설정하면 서버에서 트랜잭션 상태를 플러시하기 위해 `SetDbParameterPacket`과 `CommitPacket`을 보냅니다. 두 요청은 하나의 CAS 세션에 적용됩니다. 그 사이 CAS가 재활용되면 대체 세션에 새 값을 먼저 복원한 뒤 그 세션으로 `COMMIT`을 보냅니다(호출당 재접속은 최대 한 번). `COMMIT`이 실패하면 연결을 닫고 이전 값을 유지하며 원인을 연결한 `OperationalError`를 발생시킵니다(#551).
 
 ```python
 conn = pycubrid.connect(database="testdb")
@@ -732,6 +816,17 @@ SQL 문을 준비하고 실행합니다.
 
 **반환:** 커서 자신 (체이닝용).
 
+이전 쿼리 핸들을 닫은 뒤 `execute()`는 파라미터를 바인딩하거나 새 문장을 보내기
+전에 결과 상태를 초기화하며, 버퍼에 남은 행과 보관 중인 FETCH 페이지 오류도
+버립니다. 바인딩이나 요청이 실패하면 `description`은 `None`, `rowcount`는 `-1`,
+`lastrowid`는 `None`이 되고, fetch 메서드는
+`InterfaceError("No result set available")`를 발생시킵니다. 이후 `execute()`가
+성공하면 커서를 다시 사용할 수 있습니다. 이전 핸들을 닫는 데 실패하면
+`execute()`는 버퍼에 남은 결과와 페이지 오류를 유지하지만, 연결 무효화나 재접속
+처리가 핸들을 해제할 수 있습니다. 새 요청의 응답을 디코딩할 수 없더라도 그 응답이
+새 쿼리 핸들을 열었다면 정리를 위해 계속 추적합니다. 이 동작은 `Cursor`와
+`AsyncCursor`에 모두 적용됩니다.
+
 **발생:**
 - 커서가 닫혔으면 `InterfaceError`
 - SQL 오류나 파라미터 불일치 시 `ProgrammingError`
@@ -762,6 +857,7 @@ cur.execute("INSERT INTO users (name, age) VALUES (?, ?)", ["alice", 30])
 | `datetime.date`      | `DATE'YYYY-MM-DD'` |
 | `datetime.time`      | `TIME'HH:MM:SS'` |
 | `datetime.datetime`  | `DATETIME'YYYY-MM-DD HH:MM:SS.mmm'` |
+| `Set` / `Multiset` / `Sequence` | `SET{...}` / `MULTISET{...}` / `SEQUENCE{...}` |
 
 ---
 
@@ -875,6 +971,20 @@ if row:
 > 투명 재실행이나 holdable 결과를 보장하지 않으며, 재연결 무효화의 별도
 > `OperationalError`는 유지합니다.
 
+> **이후 fetch 페이지의 데이터 오류 (#507):** FETCH 페이지에 pycubrid가 표현할 수
+> 없는 값(연결 charset으로 유효하지 않은 텍스트 #492, 해석할 수 없는 타임존 #413,
+> 0 날짜 #512)이 들어 있으면, 그 페이지에 도달한 `fetchone()`, `fetchmany()`,
+> `fetchall()` 호출(또는 반복 단계)이 `DataError`를 발생시킵니다. 잘못된 값보다
+> 앞선 행을 포함해 페이지 전체가 반환되지 않습니다. 그 호출이 이미 모은 행은
+> 사라지지 않고, 다음 fetch 호출이 서버에 요청하지 않고 반환합니다. 따라서 오류
+> 뒤의 `fetchmany()`나 `fetchall()`은 그 행들을 반환합니다(요청한 수보다 적을 수
+> 있음). 그 뒤로는 `execute()` 또는 `close()` 전까지 모든 fetch가 페이지를 다시
+> 요청하지 않고 같은 `DataError`를 다시 발생시키며, 실패한 페이지와 그 이후의 행은
+> 반환되지 않습니다. 연결은 계속 사용할 수 있고 커서는 서버 핸들을 유지합니다.
+> 동기·비동기 커서의 동작은 같습니다. 해당 값 이후를 읽으려면 SQL에서 값을
+> 변환([0 날짜 또는 날짜시간 값](TROUBLESHOOTING.md#0-날짜-또는-날짜시간-값) 참고)한
+> 뒤 다시 실행하세요.
+
 ---
 
 #### `fetchmany(size)`
@@ -923,8 +1033,18 @@ def callproc(
 
 **반환:** 원본 `parameters` 시퀀스 (PEP 249에 따라).
 
+저장 함수의 반환값은 결과 집합의 한 행입니다. `fetchone()`으로 가져옵니다.
+`execute("CALL ...")`(예: `CALL find_user('dba') ON CLASS db_user` 같은 메서드
+호출 포함)와 `EVALUATE`도 같습니다. 각 값은 와이어에서 자신의 타입을 함께 전달하며
+해당 타입의 컬럼 값처럼 디코딩됩니다(`INT`는 `int`, `VARCHAR`는 `str`,
+`DATETIME`은 `datetime`, 객체는 `"OID:@page|slot|volume"` 문자열, SQL `NULL`은
+`None`). #542 이전에는 이 값들이 원시 `bytes`로 반환되었습니다. 브로커가 이 컬럼의
+타입을 알려주지 않으므로 `description`의 컬럼 타입은 `NULL`(`0`)입니다.
+
 ```python
 cur.callproc("my_procedure", [1, "hello"])
+cur.callproc("my_function")
+(value,) = cur.fetchone()
 ```
 
 ---
@@ -1097,6 +1217,16 @@ with conn.cursor() as cur:
 `AsyncConnection`은 동기 `Connection.ping()`과 동등한 비동기 `ping()`을 노출합니다. `create_lob()`은 동기 전용으로 유지됩니다.
 같은 `AsyncConnection`의 동시 awaiter는 연결별 `asyncio.Lock`으로 직렬화되므로 공유 사용이 안전하지만, 요청은 여전히 한 번에 하나씩 실행됩니다.
 
+`await conn.connect()`가 세션을 열고 설정(백슬래시 이스케이프 probe, autocommit)하는 동안 — `ping(reconnect=True)`와
+`close()` 후 `connect()`의 재연결도 포함 — 같은 연결에 대한 다른 task의 작업은 설정이 끝날 때까지 대기합니다.
+설정이 실패하면 세션은 폐기되고 대기 중인 각 task는 자신만의 예외를 발생시킵니다(#554). pycubrid 오류는 같은
+클래스(하위 클래스의 생성자가 다르면 가장 가까운 `pycubrid.exceptions` 클래스)와 같은 `code`, `errno`,
+`sqlstate`를 가진 새 인스턴스로(원래 예외는 `__cause__`), 그 밖의 오류는 그 오류를 명시한 `OperationalError`
+(`connection setup failed in another task: TimeoutError()`)로, 취소된 설정은 `OperationalError`로 발생합니다.
+즉 `connect()`를 실행하는 task를 취소해도 그 task만 취소됩니다. 대기 중인 task 자체가 취소되면 여전히
+`asyncio.CancelledError`가 발생합니다. 요청 내부의 CHECK_CAS 복구(#485)는 대신 연결 lock 아래에서 실행되며,
+그 실패는 복구를 일으킨 요청에서 발생하고, 이후 요청은 연결이 닫힌 상태(`InterfaceError`)를 봅니다.
+
 `AsyncConnection.__init__`은 키워드 전용 `autocommit: bool = False` 인자를 받으며, `await conn.connect()`가 처음 완료될 때 자동 적용됩니다 — `await conn.set_autocommit(True)`과 같은 효과이지만, `pycubrid.aio.connect()` 팩토리를 거치지 않고 `AsyncConnection`을 직접 생성할 때도 사용할 수 있습니다.
 
 ```python
@@ -1110,7 +1240,7 @@ async with await pycubrid.aio.connect(database="testdb") as conn:
 ### `set_autocommit(value)`
 
 `AsyncConnection.autocommit`은 읽기 전용입니다. 변경하려면 `await conn.set_autocommit(True)`을 사용하세요.
-동기 세터처럼 `SetDbParameterPacket`과 `CommitPacket` 둘 다 보냅니다.
+동기 세터처럼 `SetDbParameterPacket`과 `CommitPacket`을 하나의 CAS 세션에서 보내며, CAS 재활용 및 실패 시 동작도 같습니다(#551).
 
 ### `ping(reconnect=True)`
 
@@ -1131,7 +1261,8 @@ async def ping(self, reconnect: bool = True) -> bool
 - `reconnect=True`이면 기존 소켓을 먼저 검사하고, 연결이 끊겼거나 전송/프로토콜
   오류가 발생했거나 `CHECK_CAS`가 음수 코드로 CAS–DB 링크 장애를 보고하면
   재접속을 한 번 시도합니다. `reconnect=False`는 음수 응답을 `False`로 보고하고
-  재접속하지 않습니다. 명시적으로 설정한 autocommit만 복원하며 임의의
+  재접속하지 않으며, 동기 드라이버처럼 그 손상된 세션을 닫습니다(이후 호출은
+  `InterfaceError`). 명시적으로 설정한 autocommit만 복원하며 임의의
   SQL을 자동 재실행하지 않습니다.
   자동 `no_backslash_escapes` 모드는 새 물리 세션마다 감지하지만 정상적인
   동일 세션 검사에서는 감지하지 않습니다. 명시적 `True`/`False`는 유지됩니다.
@@ -1420,7 +1551,9 @@ class DataError(DatabaseError)
 그 코덱으로 인코딩할 수 없을 때(해당 요청은 전혀 전송되지 않음)도 발생하며, `TIMESTAMPTZ`/`TIMESTAMPLTZ`/`DATETIMETZ`/`DATETIMELTZ` 값의 리전을
 클라이언트의 IANA 타임존 데이터베이스로 해석할 수 없거나(`tzdata` 설치 필요) 오프셋이
 ±24시간을 벗어날 때도 발생합니다(#413). 응답은 모두 읽었으므로 일반 커서에서는 연결을
-계속 사용할 수 있습니다. `get_schema_info()`는 해석할 수 없는 FC9 응답을 받으면 연결을
+계속 사용할 수 있으며, 이후 fetch 페이지에서 발생한 경우 그 페이지 전에 모은 행은
+먼저 반환됩니다([`fetchone()`](#fetchone)의 *이후 fetch 페이지의 데이터 오류* 참고,
+#507). `get_schema_info()`는 해석할 수 없는 FC9 응답을 받으면 연결을
 폐기합니다. 명시적 prepared API(`pycubrid.compat.native`)는 대신 `OperationalError`를
 발생시키고 세션을 폐기합니다.
 
@@ -1560,3 +1693,43 @@ t = pycubrid.Time(14, 30, 0)
 ts = pycubrid.Timestamp(2025, 1, 15, 14, 30, 0)
 b = pycubrid.Binary(b"\x00\x01\x02")
 ```
+
+### 타입 지정 컬렉션 파라미터
+
+```python
+class Set(elements: Iterable[Any] = ())
+class Multiset(elements: Iterable[Any] = ())
+class Sequence(elements: Iterable[Any] = ())
+```
+
+`pycubrid.types`에 정의되고 `pycubrid`에서 export됩니다(#567에서 추가). 각각 원소를 불변 `tuple`로 감싸며, 일반 동기/비동기 커서의 `execute()`/`executemany()`에서 타입이 지정된 CUBRID 컬렉션 리터럴 하나로 바인딩됩니다. 일반 `set`/`list`/`tuple` 파라미터는 계속 거부됩니다.
+
+| 클래스 | 리터럴 | 서버 의미 |
+|---|---|---|
+| `Set` | `SET{...}` | 중복 제거, 순서 유지 안 함 |
+| `Multiset` | `MULTISET{...}` | 중복 유지, 순서 유지 안 함 |
+| `Sequence` | `SEQUENCE{...}` (`LIST{...}`와 같은 타입) | 중복과 순서 유지 |
+
+| 멤버 | 설명 |
+|---|---|
+| `.elements` | 저장된 원소 `tuple` |
+| `iter()`, `len()` | 원소 순회 / 개수 |
+| `==`, `hash()` | 같은 클래스이면서 원소가 같을 때만 같음(세 타입 모두 순서를 구분) |
+
+- 원소는 스칼라 파라미터 타입(`None`, `bool`, `int`, `float`, `Decimal`, `str`, `bytes`, `bytearray`, `date`, `time`, `datetime`)을 받으며 같은 보호된 렌더러로 렌더링됩니다. 중첩 컬렉션을 포함한 그 밖의 값은 `ProgrammingError`를 발생시킵니다.
+- 단일 `str`/`bytes`/`bytearray` 인자는 `TypeError`, 하위 클래스 생성은 `TypeError`, 속성 설정은 `AttributeError`를 발생시킵니다.
+- `dict` 인자는 세 클래스 모두에서 `TypeError`를 발생시킵니다(키만 조용히 쓰이고 값은 버려지기 때문). `Sequence`는 `set`/`frozenset` 인자에도 `TypeError`를 발생시킵니다(순회 순서가 보장되지 않기 때문). `Set`과 `Multiset`은 `set`/`frozenset`을 그대로 받습니다.
+- 이 인스턴스들은 `copy.copy()`(항상 같은 객체를 반환), `copy.deepcopy()`(모든 원소가 그 자체로 불변이면 같은 객체를 반환하고, `bytearray`처럼 가변인 원소가 있으면 원소까지 독립적으로 복사한 별개의 객체를 반환)와 `pickle`(동등한 인스턴스로 왕복)에 안전합니다. 기존 인스턴스에서 `__init__`을 다시 호출해도 아무 효과가 없으며 변경할 수 없습니다.
+- 조회한 컬렉션은 이 클래스로 반환되지 않습니다: `decode_collections=True`이면 여전히 `frozenset`(`SET`)과 `list`(`MULTISET`/`SEQUENCE`)입니다.
+- `Sequence`는 `typing`/`collections.abc`에도 있는 이름입니다. `from pycubrid import *`는 (`Set`과 함께) 이 이름을 이 클래스들로 가립니다. 같은 모듈에서 둘 다 필요하다면 `from pycubrid.types import Sequence as CubridSequence`처럼 명시적으로 import하세요.
+
+```python
+from pycubrid import Multiset, Sequence, Set
+
+cur.execute(
+    "INSERT INTO t (tags, words, steps) VALUES (?, ?, ?)",
+    (Set([1, 2, 3]), Multiset(["a", "a"]), Sequence([3, 1, 2])),
+)
+```
+
+[파라미터 바인딩](PARAMETER_BINDING.md#타입-지정-컬렉션-파라미터)을 참고하세요.

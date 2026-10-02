@@ -47,7 +47,7 @@ graph TD
 |---|---|
 | `__init__.py` | PEP 249 module globals (`apilevel`, `threadsafety`, `paramstyle`), `connect()`, re-exports |
 | `exceptions.py` | `Warning`, `Error`, `InterfaceError`, `DatabaseError` + 6 subclasses |
-| `types.py` | `DBAPIType` class, `STRING`/`BINARY`/`NUMBER`/`DATETIME`/`ROWID` type objects, constructors |
+| `types.py` | `DBAPIType` class, `STRING`/`BINARY`/`NUMBER`/`DATETIME`/`ROWID` type objects, constructors, typed `Set`/`Multiset`/`Sequence` parameters |
 | `constants.py` | `CASFunctionCode` (41 funcs), `CUBRIDDataType` (27+ types), `CUBRIDStatementType`, protocol/data-size constants |
 | `packet.py` | Low-level binary read/write with big-endian byte ordering |
 | `protocol.py` | High-level CAS packet classes for each function code (20 packet types) |
@@ -65,15 +65,57 @@ graph TD
 [8:]   PAYLOAD      (variable length)
 ```
 
+Reply parsing never reads past the end of a reply (#383): a negative or
+overrunning length, a row cell whose value does not use exactly its declared
+size (#523), or collection elements that do not fill their size, raise
+`ValueError`, which the connection reports as `OperationalError('malformed
+response from broker')` and closes. Trailing bytes after the last declared
+value are not checked; `DataError` is only for a complete reply (#492, #512):
+undecodable column metadata text re-walks the remaining metadata by length
+(#581), and FC41/refreshed FC3 defer that error until their declared tail and
+inline rows have been validated without application hooks (#591). Later
+structural errors close the session; complete replies retain the first
+metadata DataError.
+
+Known decoded collection elements validate their declared sizes and consumed
+bytes even after a complete element raises DataError (#595). Later structural
+damage wins; complete collections retain the first conversion error. Opaque
+and unsupported nested member layouts keep their existing raw-byte contracts.
+
+Typed collection FC3 binds (#482; public only through `compat.native`
+`set.imports()`/`bind_set()`, #440) send
+the kind byte (SET `16`, MULTISET `17`, SEQUENCE `18`) as the type argument
+and `[element type][int32 len, payload]*` as the value, with no element count.
+INT elements are 4 bytes, STRING (`2`) elements are connection-charset bytes
+plus NUL, and a NULL element has length 0. The broker silently keeps a partial
+collection when an element length overruns the value, so validate every
+element (flat tuple, no mixed/nested/bool/float/bytes) before building bytes.
+Whole SQL NULL stays the scalar NULL pair. 10.2/11.4 brokers reject the
+MULTISET kind with -454. The public #440 `imports()` matches the official
+bytes: STRING elements whatever the requested type, default kind SET, and
+`kind=MULTISET` sent as SEQUENCE.
+
 `CAS_INFO[0]` is transaction status: `0` is OUT_TRAN and `1` is IN_TRAN.
 OUT_TRAN after END_TRAN is not a signal to reconnect; retain the physical
 session. Because the CAS may still close the socket after an OUT_TRAN reply
 (memory restart, broker reset, CHANGE CLIENT), probe with CHECK_CAS before the
 next request (JDBC `checkReconnect` parity) and replace the session only when
 that probe fails: once per request, before the request is first sent, restoring
-driver-owned state (#485). Explicit `ping(reconnect=True)` also recovers a
+driver-owned state (#485). Verification is explicit and per reply: every reply
+is recorded unverified, and only OPEN_DATABASE, a successful CHECK_CAS or a healthy
+ping marks it verified (#525); never key it on object identity, bytes or a
+reconnect-only generation. Explicit `ping(reconnect=True)` also recovers a
 confirmed CAS/transport failure; arbitrary SQL is never replayed automatically.
 Commit/rollback CLOSE_REQ open cursor handles before END_TRAN.
+With broker statement pooling on, autocommit releases (and cursors collected
+without close) queue their handle ids for the next FC41's extra prepare
+arguments (JDBC's wire mechanism, but result-set handles too, #488): at most 256
+per statement, per physical generation, CLOSE_REQ'd at commit/rollback, dropped
+on session retirement. With pooling off, known transaction-ending OUT_TRAN
+replies retire existing handle ownership before parsing or identity lookup
+(#584); FC41 success/DataError adoption cannot restore the already-freed ID.
+Cached rows/counts remain usable, and only still-owned handles use immediate
+CLOSE_REQ. Other OUT_TRAN echoes and schema/manual FETCH are not boundaries.
 With `no_backslash_escapes` unset, probe each newly opened physical session
 before binding against it; explicit `True`/`False` remains pinned. Healthy
 same-session ping does not probe. A failed probe makes direct connect raise or
@@ -87,6 +129,12 @@ heterogeneous failover.
 
 1. **ClientInfoExchange**: Send 10 bytes (NO header) — magic `"CUBRS"` when `ssl` is requested (STARTTLS) or `"CUBRK"` plaintext, plus client type + version. Broker replies a 4-byte int32: `0`=ok, `<0`=fail-fast (`OperationalError`), `>0`=redirect port (reconnect on the new port WITHOUT repeating the handshake).
 2. **TLS upgrade (optional)**: If `ssl` was truthy, upgrade the live transport via `loop.start_tls()` (async) or `ssl.SSLContext.wrap_socket()` (sync) before `OPEN_DATABASE`.
+   The handshake uses `read_timeout` or a 10-second default; the default does not
+   limit later requests. On Python 3.10, the async certificate preflight uses
+   memory BIOs on an owned socket: each send/receive and completion share one
+   monotonic deadline, required final-flight failures propagate, and optional
+   close-notify cannot extend the deadline. The owned socket always closes.
+   The primary sync Python 3.10 reset limitation is documented in CONNECTION.md.
 3. **OpenDatabase**: Send db/user/password (628 bytes payload, no header — `PacketWriter(reserve_header=False)`)
 4. **PrepareAndExecute / Prepare+Execute → Fetch → CloseQuery → EndTran → CloseDatabase**
 
@@ -106,6 +154,11 @@ heterogeneous failover.
   nonzero means NOT NULL. Normalize it to `is_nullable` / DB-API `null_ok`.
 - Column metadata keeps first-byte collection flags (`0x60`) distinct from the
   scalar/element type; `0x80` marks a full second type byte, not a scalar-only column.
+- Cells of CALL/EVALUATE results and of NULL-typed columns carry their own type
+  header, counted in the cell size, in the same layout: two bytes
+  (`0x80 | collection bits | charset`, type) under protocol 7+, one byte from older
+  brokers (#542). The row parser and the bounds re-walk before `DataError` read it
+  with one helper; a header longer than its cell is malformed.
 - FC9 schema metadata is condensed: type, scale, precision and name only, without
   SELECT constraint fields. Schema packets are owned by their original connection:
   consume with fetch_schema_info or abandon with close_schema_info, never replay
@@ -127,7 +180,7 @@ make install          # pip install -e ".[dev]"
 make test             # Offline tests with 95% coverage threshold
 make lint             # ruff check + format
 make format           # Auto-fix lint/format
-make integration      # Docker → integration tests → cleanup
+make integration      # Docker → readiness wait → integration tests → skip audit → cleanup
 ```
 
 ### Test Commands (manual)
@@ -137,10 +190,10 @@ make integration      # Docker → integration tests → cleanup
 pytest tests/ -v --ignore=tests/test_integration.py \
   --cov=pycubrid --cov-report=term-missing --cov-fail-under=95
 
-# Integration (requires Docker)
-docker compose up -d
-export CUBRID_TEST_URL="cubrid://dba@localhost:33000/testdb"
-pytest tests/test_integration.py -v
+# Integration (requires Docker; waits for readiness, always cleans up)
+make integration CUBRID_TEST_PORT=33522   # any free port; default 33000
+# Existing server: CUBRID_TEST_HOST/CUBRID_TEST_PORT (win over CUBRID_TEST_URL).
+# Configured but unreachable -> tests error; unconfigured -> tests skip.
 ```
 
 ### Test Stats
@@ -206,11 +259,16 @@ access is not a prerequisite for proposing a contribution.
 ## Release Process
 
 Version is single-sourced from `pycubrid/__init__.py` → `__version__ = "x.y.z"`
-(`pyproject.toml` reads it dynamically). The full maintainer procedure — release PR,
-`make release-check VERSION=x.y.z`, tagging the squash-merged commit, waiting for the
-tag-triggered `integration-full.yml` + `create-release.yml`, the manual
-`publish-pypi.yml` dispatch, cookbook smoke, and recovery — lives in
-[`RELEASING.md`](RELEASING.md). There is no `make release`; never tag a local commit.
+(`pyproject.toml` reads it dynamically). Merging a reviewed release PR is the only
+normal way to release: `prepare-release.yml` opens it (dated CHANGELOG section +
+version bump, checked by `make release-check VERSION=x.y.z`), and after the
+squash-merge `release.yml` detects the version change and runs consistency → full
+matrix → build → tag/Release/PyPI → cookbook verification (the cookbook smoke test
+called as a pinned reusable workflow, no token) → summary on its own.
+Ordinary PRs never change `__version__` or date a CHANGELOG section. Never push
+tags or publish by hand; the only manual entry point is the narrow recovery
+dispatch of `release.yml`. Procedure, failure matrix and recovery:
+[`RELEASING.md`](RELEASING.md).
 
 ## CI Matrix
 
@@ -219,15 +277,15 @@ tag-triggered `integration-full.yml` + `create-release.yml`, the manual
 | File | Trigger | Purpose |
 |---|---|---|
 | `.github/workflows/ci.yml` | Push to main, PRs | Lint + offline tests (Py 3.10–3.14) + regular integration matrix |
-| `.github/workflows/integration-full.yml` | Nightly (03:00 UTC), tag push, manual dispatch | Full Python × CUBRID compatibility matrix |
-| `.github/workflows/create-release.yml` | Tag push, manual dispatch | Create the GitHub Release from CHANGELOG + attach SBOM (does not publish) |
-| `.github/workflows/publish-pypi.yml` | Manual dispatch (`-f tag=vX.Y.Z`) after tag-triggered integration-full passes | Verify, build, publish to PyPI, then dispatch the cookbook smoke test |
+| `.github/workflows/integration-full.yml` | Nightly (03:00 UTC), manual dispatch, `workflow_call` from `release.yml` | Full Python × CUBRID compatibility matrix |
+| `.github/workflows/prepare-release.yml` | Manual dispatch (`-f version=X.Y.Z`) | Open the `chore: release vX.Y.Z` PR (dated CHANGELOG section + version bump) |
+| `.github/workflows/release.yml` | Push to main; recovery dispatch (`resume` / `verify-only` / `dry-run`) | Detect a merged release, then matrix, build, tag + GitHub Release + PyPI, cookbook verification, summary |
 
 ### Matrix Shape
 
 - **Offline (every PR/push)**: Python 3.10, 3.11, 3.12, 3.13, 3.14
 - **Integration (every PR/push)**: Python {3.10, 3.14} × CUBRID {10.2, 11.0, 11.2, 11.4} — 8 jobs
-- **Integration full (nightly + tag push + dispatch)**: Python {3.10, 3.11, 3.12, 3.13, 3.14} × CUBRID {10.2, 11.0, 11.2, 11.4} — 20 jobs
+- **Integration full (nightly + dispatch + every release)**: Python {3.10, 3.11, 3.12, 3.13, 3.14} × CUBRID {10.2, 11.0, 11.2, 11.4} — 20 jobs
 
 ## Test Structure
 
@@ -306,8 +364,8 @@ issue title or body. Reporters describe urgency and effort without needing label
 permissions. Maintainer-created issues receive these labels at creation; permissionless
 reports receive them during initial maintainer triage.
 
-Use a short issue title prefix such as `fix:`, `feat:`, `docs:`, `ci:`,
-`chore:`, `test:`, or `perf:` (with an optional scope before the colon).
+Issue titles use the same `type(scope): description` format as pull request
+titles (see [CONTRIBUTING.md](CONTRIBUTING.md#pull-request-and-commit-titles)).
 `.github/workflows/issue-triage.yml` flags incomplete human-submitted issue
 titles or labels as `status: needs triage` without posting a comment or
 guessing priority/size. Maintainers remove that label once triage is complete.
@@ -375,6 +433,15 @@ Do not mark work complete until code, tests, and documentation are consistent.
 
 ## Commit Convention
 
+Issue titles, pull request titles and commit subjects follow
+[CONTRIBUTING.md - Pull request and commit titles](CONTRIBUTING.md#pull-request-and-commit-titles):
+`type(scope)!: description` with types `feat`, `fix`, `docs`, `test`, `perf`,
+`refactor`, `ci`, `build`, `chore`, `style`, `revert`; English, lowercase start
+unless the first word is an API name, acronym, or proper noun; no trailing
+period, no issue numbers in pull request titles (use `Closes #N` /
+`Refs #N` in the body). Pull requests are squash-merged and the pull request
+title becomes the commit title. The `PR title` check enforces it.
+
 Preserve actual contributor authorship and existing credits. The following tool
 attribution applies to commits actually produced with that tool; it is not a
 required footer for outside contributors' commits.
@@ -387,8 +454,6 @@ required footer for outside contributors' commits.
 Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-opencode)
 Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
 ```
-
-Types: `feat`, `fix`, `docs`, `chore`, `ci`, `style`, `test`, `refactor`
 
 ## Project Context — Performance Loop System
 

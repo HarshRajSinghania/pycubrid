@@ -22,6 +22,7 @@ Complete reference for pycubrid's PEP 249 type objects, constructors, and CUBRID
 - [Collection Types](#collection-types)
   - [JSON Columns](#json-columns)
   - [`decode_collections`](#decode_collections)
+  - [Binding Collections](#binding-collections)
 - [Usage Examples](#usage-examples)
 
 ---
@@ -312,6 +313,24 @@ How pycubrid converts CUBRID wire types to Python objects when fetching results:
 > If the session zone changes, the same stored instant is returned with a
 > different UTC offset. `TIMESTAMPTZ` and `DATETIMETZ` carry their own zone.
 
+> **Zero dates (#512):** CUBRID accepts zero values such as `DATE'0000-00-00'`,
+> `DATETIME'0000-00-00 00:00:00'` and zero `TIMESTAMP`, `TIMESTAMPTZ`,
+> `TIMESTAMPLTZ`, `DATETIMETZ` and `DATETIMELTZ` values, but Python's `datetime`
+> has no year 0. Fetching one raises `DataError` naming the CUBRID type and
+> fields, on `execute()` and on a later fetch page alike; the connection stays
+> usable, and the cursor keeps its server handle as for invalid UTF-8 (#492).
+> On a later page, rows fetched before that page are still returned, and
+> fetches after them keep raising the same `DataError` until the next
+> `execute()` (#507).
+> Any other temporal field Python cannot hold is reported the same way.
+> There is no option to return `None` or text instead: convert the value in
+> SQL, for example `NULLIF(d, DATE'0000-00-00')` (zero becomes `NULL`),
+> `CASE WHEN d = DATE'0000-00-00' THEN NULL ELSE d END`, or
+> `TO_CHAR(d, 'YYYY-MM-DD')` (returns `'0000-00-00'`). The explicit prepared
+> API (`pycubrid.compat.native`) stays fail-closed: it raises
+> `OperationalError` and retires the session. See
+> [Zero Date or Datetime Value](TROUBLESHOOTING.md#zero-date-or-datetime-value).
+
 > **Zone decoding (#413):** CUBRID sends each value's zone as text: an offset
 > (`+05:30`) or a region name with the abbreviation in effect
 > (`Asia/Seoul KST`, `UTC UTC` for the LTZ types). pycubrid resolves:
@@ -433,6 +452,58 @@ This opt-in behavior keeps fetches allocation-light when applications prefer to 
 | `False` (default) | Return collection payloads as raw CAS wire `bytes` |
 | `True` | Decode supported `SET`, `MULTISET`, and `SEQUENCE` payloads into Python containers |
 
+### Binding Collections
+
+Plain Python `set`, `frozenset`, `list` and `tuple` values are rejected as
+parameters. To bind a collection, wrap its elements in one of the typed
+collection parameters (#567):
+
+| Class | Rendered literal | Server semantics |
+|---|---|---|
+| `pycubrid.types.Set` | `SET{...}` | duplicates removed, order not kept |
+| `pycubrid.types.Multiset` | `MULTISET{...}` | duplicates kept, order not kept |
+| `pycubrid.types.Sequence` | `SEQUENCE{...}` (same type as `LIST{...}`) | duplicates and order kept |
+
+```python
+from pycubrid.types import Multiset, Sequence, Set
+
+cur.execute("INSERT INTO t VALUES (?, ?, ?)", (Set([1, 2]), Multiset(["a", "a"]), Sequence([3, 1])))
+```
+
+The classes are also exported from the top-level `pycubrid` package. Each one is
+immutable, stores its elements as a `tuple` (`.elements`) and cannot be
+subclassed. Elements accept the same types as scalar parameters (`None`, `bool`,
+`int`, `float`, `Decimal`, `str`, `bytes`, `bytearray`, `date`, `time`,
+`datetime`) and are rendered by the same hardened renderer; nested collections
+raise `ProgrammingError`. Both sync and async ordinary cursors support them. See
+[Parameter Binding](PARAMETER_BINDING.md#typed-collection-parameters).
+
+A `dict` is rejected (`TypeError`) by all three classes — iterating it would
+silently use only its keys and drop the values. `Sequence` also rejects a
+`set`/`frozenset` (`TypeError`), since their iteration order is not
+guaranteed and would make an ordered collection's element order
+nondeterministic; `Set` and `Multiset` accept a `set`/`frozenset` since their
+own server-side semantics already discard order. The instances are safe to
+`copy.copy()` (always returns the same object), `copy.deepcopy()` (the same
+object when every element is itself immutable; an independent copy, with
+independently copied elements, when an element such as `bytearray` is
+mutable, so mutating the copy cannot alias back into the original) and
+`pickle` (round-trips to an equal instance), and re-invoking `__init__` on
+an existing instance cannot mutate it.
+
+`Set`, `Multiset` and `Sequence` are ordinary names in `pycubrid.types` and
+`pycubrid`, not `typing` aliases, but `Sequence` in particular is also a name
+from the standard `typing`/`collections.abc` modules. `from pycubrid import *`
+brings pycubrid's `Set` and `Sequence` into scope and shadows any
+`typing.Set`/`typing.Sequence` (or `collections.abc.Sequence`) imported the
+same way; prefer an explicit import such as
+`from pycubrid.types import Sequence as CubridSequence` (or import
+`pycubrid` and use `pycubrid.Sequence`) when both are needed in the same
+module.
+
+Decoding is unchanged: fetched collections are plain Python containers as in the
+table above (with `decode_collections=True`), never these parameter types.
+
 ---
 
 ## Usage Examples
@@ -485,6 +556,23 @@ cur.execute(
 conn.commit()
 cur.close()
 conn.close()
+```
+
+### Decimal Parameters
+
+`Decimal` parameters are sent as plain fixed-point literals (never E notation),
+so CUBRID keeps them `NUMERIC` with the scale you wrote: `Decimal("0.0000001")`
+fetches back as `Decimal`, not `float`. A value whose plain literal needs more
+than 38 digits, CUBRID's maximum `NUMERIC` precision, raises `DataError`
+instead of becoming `DOUBLE`. See
+[Parameter Binding: Decimal parameters](PARAMETER_BINDING.md#decimal-parameters).
+
+```python
+from decimal import Decimal
+
+cur.execute("SELECT ?", [Decimal("0.0000001")])  # sent as 0.0000001
+assert cur.fetchone()[0] == Decimal("0.0000001")
+assert cur.description[0][1] == pycubrid.constants.CUBRIDDataType.NUMERIC
 ```
 
 ### Using CUBRIDDataType Enum
